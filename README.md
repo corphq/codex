@@ -6,7 +6,7 @@ builds and publishes release artifacts from upstream.
 ## Install with Homebrew
 
 ```bash
-brew tap corphq/codex
+brew tap corphq/codex https://github.com/corphq/codex
 brew install codex
 ```
 
