@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Cargo workspace package version to inject (e.g., 0.98.1)"
+        required: true
+        type: string
+      upstream_tag:
+        description: "Optional upstream tag/ref to build from (e.g., v0.98.1). Defaults to main."
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build macOS Apple Silicon Release
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      TARGET: aarch64-apple-darwin
+      CHAT_GPT_BASE_URL: ${{ secrets.CHAT_GPT_BASE_URL }}
+      API_CHAT_GPT_BASE_URL: ${{ secrets.API_CHAT_GPT_BASE_URL }}
+      AB_CHAT_GPT_BASE_URL: ${{ secrets.AB_CHAT_GPT_BASE_URL }}
+    steps:
+      - name: Resolve release context
+        id: release_ctx
+        shell: bash
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            source_ref="main"
+            if [[ -n "${MANUAL_UPSTREAM_TAG:-}" ]]; then
+              source_ref="${MANUAL_UPSTREAM_TAG}"
+            fi
+            version="${{ inputs.version }}"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$version" >> "$GITHUB_OUTPUT"
+            echo "release_name=$version" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          releases="$(gh api /repos/openai/codex/releases?per_page=20)"
+          stable_release="$(jq -c '[.[] | select(.draft == false and .prerelease == false)][0]' <<<"$releases")"
+
+          if [[ "$stable_release" == "null" ]]; then
+            echo "No stable release found in openai/codex."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_tag="$(jq -r '.tag_name' <<<"$stable_release")"
+          upstream_name="$(jq -r '(.name // .tag_name)' <<<"$stable_release")"
+          upstream_url="$(jq -r '.html_url' <<<"$stable_release")"
+          version="${upstream_name#v}"
+          release_tag="$version"
+
+          if gh release view "$release_tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release $release_tag already exists in ${GITHUB_REPOSITORY}; skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_name=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$upstream_tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "notes<<EOF"
+            echo "Triggered by stable upstream release: [$upstream_tag]($upstream_url)"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: No new upstream stable release
+        if: ${{ steps.release_ctx.outputs.should_run != 'true' }}
+        shell: bash
+        working-directory: .
+        run: echo "Skipping build and release because no new stable upstream release was found."
+
+      - uses: actions/checkout@v6
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        with:
+          repository: openai/codex
+          ref: ${{ steps.release_ctx.outputs.source_ref }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.93
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: actions/cache@v5
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: cargo-${{ runner.os }}-${{ env.TARGET }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Overrides
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          if [[ -z "${CHAT_GPT_BASE_URL}" || -z "${API_CHAT_GPT_BASE_URL}" || -z "${AB_CHAT_GPT_BASE_URL}" ]]; then
+            echo "CHAT_GPT_BASE_URL, API_CHAT_GPT_BASE_URL, and AB_CHAT_GPT_BASE_URL are required but not set."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          base_url = os.environ["CHAT_GPT_BASE_URL"].rstrip("/")
+          api_base_url = os.environ["API_CHAT_GPT_BASE_URL"].rstrip("/")
+          ab_base_url = os.environ["AB_CHAT_GPT_BASE_URL"].rstrip("/")
+          replacements = {
+              "https://chatgpt.com": base_url,
+              "https://api.chatgpt.com": api_base_url,
+              "https://ab.chatgpt.com": ab_base_url,
+          }
+          root = Path(".")
+
+          for path in root.rglob("*.rs"):
+              text = path.read_text()
+              updated = text
+              for old, new in replacements.items():
+                  if old in updated:
+                      updated = updated.replace(old, new)
+              if updated != text:
+                  path.write_text(updated)
+          PY
+
+      - name: Inject workspace package version
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        shell: bash
+        run: |
+          if [[ -z "${VERSION}" ]]; then
+            echo "Version is required for workflow_dispatch and schedule triggers."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("Cargo.toml")
+          lines = path.read_text().splitlines()
+
+          in_workspace_package = False
+          updated = False
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  in_workspace_package = stripped == "[workspace.package]"
+                  continue
+              if in_workspace_package and stripped.startswith("version = "):
+                  lines[i] = f'version = "{version}"'
+                  updated = True
+                  break
+
+          if not updated:
+              raise SystemExit("Missing version in [workspace.package]")
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+        env:
+          VERSION: ${{ github.event_name == 'schedule' && steps.release_ctx.outputs.version || inputs.version }}
+
+      - name: Cargo build
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          cargo build --target ${{ env.TARGET }} --release --bin codex --bin codex-responses-api-proxy
+
+      - name: Ad-hoc sign binaries
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          codesign --force --sign - "target/${{ env.TARGET }}/release/codex"
+          codesign --force --sign - "target/${{ env.TARGET }}/release/codex-responses-api-proxy"
+
+      - name: Stage artifacts
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          dest="${GITHUB_WORKSPACE}/dist/${{ env.TARGET }}"
+          mkdir -p "$dest"
+          cp "target/${{ env.TARGET }}/release/codex" "$dest/codex-${{ env.TARGET }}"
+          cp "target/${{ env.TARGET }}/release/codex-responses-api-proxy" "$dest/codex-responses-api-proxy-${{ env.TARGET }}"
+
+      - name: Create GitHub Release
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release_ctx.outputs.release_name }}
+          tag_name: ${{ steps.release_ctx.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: ${{ steps.release_ctx.outputs.notes }}
+          files: dist/${{ env.TARGET }}/*
