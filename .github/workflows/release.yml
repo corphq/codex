@@ -208,6 +208,19 @@ jobs:
           cp "target/${{ env.TARGET }}/release/codex" "$dest/codex-${{ env.TARGET }}"
           cp "target/${{ env.TARGET }}/release/codex-responses-api-proxy" "$dest/codex-responses-api-proxy-${{ env.TARGET }}"
 
+      - name: Package tarball
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          version="${{ steps.release_ctx.outputs.version }}"
+          dest="${GITHUB_WORKSPACE}/dist/${{ env.TARGET }}"
+          pkg="${GITHUB_WORKSPACE}/package"
+          rm -rf "$pkg"
+          mkdir -p "$pkg"
+          cp "target/${{ env.TARGET }}/release/codex" "$pkg/codex"
+          tar -C "$pkg" -czf "$dest/codex-${version}-${{ env.TARGET }}.tar.gz" codex
+          shasum -a 256 "$dest/codex-${version}-${{ env.TARGET }}.tar.gz" | awk '{print $1}' > "$dest/codex-${version}-${{ env.TARGET }}.tar.gz.sha256"
+
       - name: Create GitHub Release
         if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
         uses: softprops/action-gh-release@v2
@@ -218,3 +231,62 @@ jobs:
           make_latest: true
           body: ${{ steps.release_ctx.outputs.notes }}
           files: dist/${{ env.TARGET }}/*
+
+      - name: Checkout tap repository
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: tap
+          fetch-depth: 1
+
+      - name: Update Homebrew formula
+        if: ${{ steps.release_ctx.outputs.should_run == 'true' }}
+        shell: bash
+        working-directory: tap
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.release_ctx.outputs.version }}"
+          dest="${GITHUB_WORKSPACE}/dist/${{ env.TARGET }}"
+          sha256="$(cat "$dest/codex-${version}-${{ env.TARGET }}.tar.gz.sha256")"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${version}/codex-${version}-${{ env.TARGET }}.tar.gz"
+
+          mkdir -p Formula
+          cat > Formula/codex.rb <<RUBY
+          class Codex < Formula
+            desc "OpenAI Codex CLI"
+            homepage "https://github.com/openai/codex"
+            version "${version}"
+
+            on_macos do
+              on_arm do
+                url "${url}"
+                sha256 "${sha256}"
+              end
+              on_intel do
+                odie "codex is only available for Apple Silicon."
+              end
+            end
+
+            def install
+              bin.install "codex"
+            end
+
+            test do
+              system "#{bin}/codex", "--help"
+            end
+          end
+          RUBY
+
+          if git diff --quiet -- Formula/codex.rb; then
+            echo "Homebrew formula is up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/codex.rb
+          git commit -m "Update Homebrew formula for ${version}"
+          git push
