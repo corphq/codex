@@ -1,12 +1,12 @@
 class Codex < Formula
   desc "OpenAI Codex CLI"
   homepage "https://github.com/openai/codex"
-  version "0.144.6"
+  version "0.145.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/corphq/codex/releases/download/0.144.6/codex-0.144.6-aarch64-apple-darwin.tar.gz"
-      sha256 "578ef6159b9f0cf808234f8ad512ef4783f358a666b44a93143917019b23ee62"
+      url "https://github.com/corphq/codex/releases/download/0.145.0/codex-0.145.0-aarch64-apple-darwin.tar.gz"
+      sha256 "6d685087c4c341b03851df8724c3d3e686ed78342a5f65756d318cf345051cc0"
     end
     on_intel do
       odie "codex is only available for Apple Silicon."
